@@ -88,15 +88,6 @@ pcb2gcode --front=front.gbr --outline=outline.gbr --drill=drill.drl
 # Use the optimized files with your CNC controller
 ```
 
-## Why Use This Tool?
-
-`pcb2gcode` generates excellent G-code for PCB milling, but it includes tool change operations by default and moves to the starting point in an unsafe manner.
-
-This tool automates the process of:
-
-1. Removing pauses for tool changes when you want to run a single-tool operation
-2. Optimizing the tool path to move to safely position first before plunging, which reduces the risk of damaging the drill bit and a jig.
-
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. 
