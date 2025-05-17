@@ -78,7 +78,7 @@ Example workflow:
 
 ```bash
 # Generate G-code with pcb2gcode
-pcb2gcode --front=front.gbr --outline=outline.gbr --drill=drill.drl
+# pcb2gcode [...]
 
 # Process the generated G-code
 ./pcb2gcode-millready.py front.ngc front_millready.ngc
