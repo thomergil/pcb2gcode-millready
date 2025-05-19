@@ -17,17 +17,15 @@ import os
 import sys
 
 # Constants
-# XY/Z swap pattern constants
-MIN_PATTERN_LINES = 4  # Minimum lines needed for Z/XY swap pattern
+# (MIN_PATTERN_LINES is no longer used and has been removed)
 
 
 def swap_z_and_xy_moves(infile, outfile):
     """
-    Swap Z-down moves followed by X,Y moves to be X,Y moves followed by Z-down.
-
-    This modification ensures the tool moves to the starting position first, then plunges down.
-    Only the first occurrence is swapped, which typically is the start of the actual milling operation.
-    This function also adds a move to machine Z0 (using G53) before the X,Y move to ensure tool clearance.
+    Swap an initial G00 Z-safe height move and a subsequent G00 X,Y rapid
+    positioning move. This ensures the tool moves to the X,Y starting position
+    first, then descends to a safe Z height before any further plunging.
+    Only the first occurrence is swapped.
 
     Args:
         infile (str): Path to input G-code file
@@ -37,7 +35,7 @@ def swap_z_and_xy_moves(infile, outfile):
         bool: True if the swap was performed, False otherwise
     """
     # Read the input file
-    with open(infile, 'r') as f:
+    with open(infile, "r") as f:
         lines = f.readlines()
 
     new_lines = []
@@ -45,43 +43,68 @@ def swap_z_and_xy_moves(infile, outfile):
     swapped = False  # Flag to track if we've already done the swap
 
     while i < len(lines):
-        # Look for Z-down move followed by X,Y move, but only swap the first occurrence
-        if (not swapped and i+MIN_PATTERN_LINES-1 < len(lines) and
-            re.search(r'G0[0-9]?\s+Z-', lines[i]) and  # Z-down move
-            'G04 P0' in lines[i+1] and  # Dwell
-            ('F' in lines[i+2] or 'F100' in lines[i+2]) and  # Feed rate
-            re.search(r'G0[0-9]?\s+X.*Y', lines[i+3])):  # X,Y move
+        current_line_stripped = lines[i].strip()
 
-            # Keep the z-move and dwell lines but save them for later
-            z_move = lines[i]
-            dwell_line = lines[i+1]
-            feed_line = lines[i+2]
-            xy_move = lines[i+3]
+        if swapped: # If already swapped, just append lines
+            new_lines.append(lines[i])
+            i += 1
+            continue
 
-            # Add the lines in the new order: Machine Z0 move first, then X,Y move, then Z down move
-            new_lines.append("G53 G0 Z0\n")  # Move to machine Z0 first for clearance
-            new_lines.append(xy_move)  # X,Y move
-            new_lines.append(z_move)   # Z move
-            new_lines.append(dwell_line)  # Dwell
-            new_lines.append(feed_line)   # Feed rate
+        # Test for Z-safe move on current_line_stripped
+        z_move_regex_str = r"G0[0]?\s+Z\s*[0-9.]+"
+        match_z = re.match(z_move_regex_str, current_line_stripped)
 
-            i += MIN_PATTERN_LINES  # Skip these 4 lines since we've handled them
-            swapped = True  # Mark that we've done the swap
+        if match_z:
+            # Potential Z-safe move found. Now look for the XY-rapid move, skipping empty/comment lines.
+            j = i + 1
+            found_xy_move_line_content = None
+            found_xy_move_line_index = -1
+            intervening_lines = []
 
-            print(f"Added machine Z0 move (G53) and swapped first occurrence of Z and X,Y moves")
+            while j < len(lines):
+                next_line_stripped = lines[j].strip()
+
+                if not next_line_stripped or next_line_stripped.startswith("("):
+                    intervening_lines.append(lines[j])
+                    j += 1
+                    continue # Skip to next line
+
+                # Found a non-empty, non-comment line. Test if it's the XY move.
+                xy_move_regex_str = r"G0[0]?\s+X.*Y"
+                match_xy = re.match(xy_move_regex_str, next_line_stripped)
+
+                if match_xy:
+                    found_xy_move_line_content = lines[j]
+                    found_xy_move_line_index = j
+                break # Stop looking whether it matched or not, as we only consider the first non-empty/comment line
+
+            if found_xy_move_line_content:
+                # Pattern found! XY move, then intervening lines, then Z move.
+                new_lines.append(found_xy_move_line_content) # XY move
+                new_lines.extend(intervening_lines)          # Intervening empty/comment lines
+                new_lines.append(lines[i])                   # Z-safe move
+
+                swapped = True
+                i = found_xy_move_line_index + 1 # Advance i past the processed XY line
+            else:
+                # Z-move was found, but no subsequent XY-move. Add current line and continue.
+                new_lines.append(lines[i])
+                i += 1
         else:
-            # Keep the line as is
+            # Not a Z-move, or already swapped. Add current line and continue.
             new_lines.append(lines[i])
             i += 1
 
     # Write the modified content to the output file
-    with open(outfile, 'w') as f:
+    with open(outfile, "w") as f:
         f.writelines(new_lines)
 
     if swapped:
-        print(f"Machine Z0 move (G53) added and Z/X,Y moves swapped (first occurrence only). Modified G-code saved to {outfile}")
+        print(
+            f"Initial G00 Z<safe_height>/X,Y rapid moves swapped. Modified G-code saved to {outfile}"
+        )
     else:
-        print(f"No Z and X,Y move pattern found to swap. G-code copied to {outfile}")
+        print(f"No initial G00 Z<safe_height>/X,Y rapid move pattern found to swap. G-code copied to {outfile}")
 
     return swapped
 
@@ -98,12 +121,12 @@ def main():
         to make them more suitable for CNC milling operations. It swaps Z/XY moves
         for safer operation.
         """,
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    parser.add_argument('infile', help='Input G-code file generated by pcb2gcode')
-    parser.add_argument('outfile', help='Output G-code file')
-    parser.add_argument('--version', action='version', version='%(prog)s 1.0.0')
+    parser.add_argument("infile", help="Input G-code file generated by pcb2gcode")
+    parser.add_argument("outfile", help="Output G-code file")
+    parser.add_argument("--version", action="version", version="%(prog)s 1.0.0")
 
     args = parser.parse_args()
 
