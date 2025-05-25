@@ -8,7 +8,7 @@ milling operations. It swaps the initial Z and X/Y moves to ensure the tool
 moves to position first before plunging. This reduces the risk of damaging the
 drill bit and a jig.
 
-It can also remove M6 tool change sequences.
+It can also remove M6 tool change sequences and fix helical arc precision issues.
 
 Note: This code was mostly generated with the assistance of AI (Claude).
 """
@@ -17,6 +17,7 @@ import re
 import argparse
 import os
 import sys
+import math
 
 # Constants
 # (MIN_PATTERN_LINES is no longer used and has been removed)
@@ -24,10 +25,17 @@ import sys
 
 def swap_z_and_xy_moves(infile, outfile):
     """
-    Swap an initial G00 Z-safe height move and a subsequent G00 X,Y rapid
-    positioning move. This ensures the tool moves to the X,Y starting position
-    first, then descends to a safe Z height before any further plunging.
-    Only the first occurrence is swapped.
+    Swap a Z move and subsequent XY rapid positioning move to ensure the tool
+    moves to the XY starting position first, then descends to the Z height.
+    This reduces the risk of damaging the drill bit or workpiece by ensuring
+    lateral movement happens at safe height.
+
+    Handles both:
+    - Traditional milling patterns: G00 Z<safe_height> followed immediately by G00 X,Y
+    - Drill file patterns: G0 Z<work_height> with intervening commands (G04, G1 F, M3/M5, T)
+      before the first G0 X,Y positioning move
+
+    Only the first occurrence in the file is swapped.
 
     Args:
         infile (str): Path to input G-code file
@@ -52,44 +60,59 @@ def swap_z_and_xy_moves(infile, outfile):
             i += 1
             continue
 
-        # Test for Z-safe move on current_line_stripped
+        # Test for Z-safe move or Z working height move
         z_move_regex_str = r"G0[0]?\s+Z\s*[0-9.]+"
         match_z = re.match(z_move_regex_str, current_line_stripped)
 
         if match_z:
-            # Potential Z-safe move found. Now look for the XY-rapid move, skipping empty/comment lines.
+            # Potential Z move found. Look for the first XY positioning move,
+            # allowing for multiple intervening commands (not just comments)
             j = i + 1
             found_xy_move_line_content = None
             found_xy_move_line_index = -1
             intervening_lines = []
+            xy_found = False
 
-            while j < len(lines):
+            while j < len(lines) and not xy_found:
                 next_line_stripped = lines[j].strip()
 
+                # Skip empty lines and comments
                 if not next_line_stripped or next_line_stripped.startswith("("):
                     intervening_lines.append(lines[j])
                     j += 1
-                    continue # Skip to next line
+                    continue
 
-                # Found a non-empty, non-comment line. Test if it's the XY move.
+                # Check if this is an XY positioning move
                 xy_move_regex_str = r"G0[0]?\s+X.*Y"
                 match_xy = re.match(xy_move_regex_str, next_line_stripped)
 
                 if match_xy:
                     found_xy_move_line_content = lines[j]
                     found_xy_move_line_index = j
-                break # Stop looking whether it matched or not, as we only consider the first non-empty/comment line
+                    xy_found = True
+                else:
+                    # Check if this is a command that could be between Z and XY moves
+                    # Common commands in drill files: G04 (dwell), G1 F (feed rate), M3/M5 (spindle)
+                    intervening_command_regex = r"(G04|G1\s+F|M[35]|T\d+)"
+                    if re.match(intervening_command_regex, next_line_stripped):
+                        intervening_lines.append(lines[j])
+                        j += 1
+                        continue
+                    else:
+                        # Found a command that's not expected between Z and XY moves
+                        # Stop looking for XY move after this Z move
+                        break
 
             if found_xy_move_line_content:
-                # Pattern found! XY move, then intervening lines, then Z move.
-                new_lines.append(found_xy_move_line_content) # XY move
-                new_lines.extend(intervening_lines)          # Intervening empty/comment lines
-                new_lines.append(lines[i])                   # Z-safe move
+                # Pattern found! Swap XY move before Z move, keep intervening commands after Z move
+                new_lines.append(found_xy_move_line_content) # XY move first
+                new_lines.append(lines[i])                   # Z move second
+                new_lines.extend(intervening_lines)          # Intervening commands after Z move
 
                 swapped = True
                 i = found_xy_move_line_index + 1 # Advance i past the processed XY line
             else:
-                # Z-move was found, but no subsequent XY-move. Add current line and continue.
+                # Z-move was found, but no suitable XY-move. Add current line and continue.
                 new_lines.append(lines[i])
                 i += 1
         else:
@@ -103,10 +126,10 @@ def swap_z_and_xy_moves(infile, outfile):
 
     if swapped:
         print(
-            f"Initial G00 Z<safe_height>/X,Y rapid moves swapped. Modified G-code saved to {outfile}"
+            f"Initial Z/X,Y rapid moves swapped (including drill file pattern). Modified G-code saved to {outfile}"
         )
     else:
-        print(f"No initial G00 Z<safe_height>/X,Y rapid move pattern found to swap. G-code copied to {outfile}")
+        print(f"No Z/X,Y rapid move pattern found to swap. G-code copied to {outfile}")
 
     return swapped
 
@@ -180,6 +203,96 @@ def remove_m6_sequences(infile, outfile):
     return sequences_removed
 
 
+def fix_helical_arcs(infile, outfile):
+    """
+    Fix helical arc precision issues by slightly offsetting the endpoint of
+    full-circle arcs. This prevents GRBL errors with arcs that start and end
+    at exactly the same XY coordinates.
+
+    Args:
+        infile (str): Path to input G-code file
+        outfile (str): Path to output G-code file
+
+    Returns:
+        int: Number of arcs fixed
+    """
+    # Read the input file
+    with open(infile, "r") as f:
+        lines = f.readlines()
+
+    new_lines = []
+    arcs_fixed = 0
+
+    # Use a very small offset angle (0.1 degrees) just to avoid mathematical degeneracy
+    offset_angle_deg = 0.1
+    offset_angle_rad = math.radians(offset_angle_deg)
+
+    for line in lines:
+        stripped_line = line.strip()
+
+        # Match G2 or G3 arc commands with X, Y, and I, J offset words
+        arc_pattern = r'^(G[23])\s+X([-+]?[0-9]*\.?[0-9]+)\s+Y([-+]?[0-9]*\.?[0-9]+)(.*)I([-+]?[0-9]*\.?[0-9]+)\s+J([-+]?[0-9]*\.?[0-9]+)(.*)$'
+        match = re.match(arc_pattern, stripped_line)
+
+        if match:
+            g_command = match.group(1)
+            start_x = float(match.group(2))
+            start_y = float(match.group(3))
+            middle_part = match.group(4)  # Any Z or other words between Y and I
+            i_offset = float(match.group(5))
+            j_offset = float(match.group(6))
+            end_part = match.group(7)  # Any remaining words after J
+
+            # Calculate the center point
+            center_x = start_x + i_offset
+            center_y = start_y + j_offset
+
+            # Calculate radius
+            radius = math.sqrt(i_offset * i_offset + j_offset * j_offset)
+
+            # Check if this could be a full circle (start point is on the circle defined by center and radius)
+            # Allow for small floating point precision errors
+            distance_to_center = math.sqrt((start_x - center_x)**2 + (start_y - center_y)**2)
+            if abs(distance_to_center - radius) < 0.0001 and radius > 0.001:  # Likely a full circle
+
+                # Calculate new endpoint with minimal offset to avoid mathematical degeneracy
+                # Get angle from center to start point
+                start_angle = math.atan2(start_y - center_y, start_x - center_x)
+
+                # For G2 (clockwise), subtract the small offset angle
+                # For G3 (counter-clockwise), add the small offset angle
+                if g_command == "G2":
+                    end_angle = start_angle - offset_angle_rad
+                else:  # G3
+                    end_angle = start_angle + offset_angle_rad
+
+                # Calculate new endpoint
+                new_end_x = center_x + radius * math.cos(end_angle)
+                new_end_y = center_y + radius * math.sin(end_angle)
+
+                # Format the new line with 5 decimal places to match pcb2gcode precision
+                new_line = f"{g_command} X{new_end_x:.5f} Y{new_end_y:.5f}{middle_part}I{i_offset:.5f} J{j_offset:.5f}{end_part}\n"
+                new_lines.append(new_line)
+                arcs_fixed += 1
+            else:
+                # Not a full circle or radius too small, keep original
+                new_lines.append(line)
+        else:
+            # Not an arc command or doesn't match pattern, keep original
+            new_lines.append(line)
+
+    # Write the modified content to the output file
+    with open(outfile, "w") as f:
+        f.writelines(new_lines)
+
+    if arcs_fixed > 0:
+        print(f"Fixed {arcs_fixed} helical arc(s) with minimal endpoint offset to avoid GRBL precision errors. Modified G-code saved to {outfile}")
+    else:
+        print(f"No helical arcs found to fix. G-code copied to {outfile}")
+
+    return arcs_fixed
+
+
 def main():
     """
     Main function to process command line arguments and execute G-code modifications.
@@ -190,7 +303,7 @@ def main():
 
         Modifies G-code files generated by pcb2gcode (https://github.com/pcb2gcode/pcb2gcode)
         to make them more suitable for CNC milling operations. It can swap Z/XY moves
-        for safer operation and remove M6 tool change sequences.
+        for safer operation, remove M6 tool change sequences, and fix helical arc issues.
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -199,6 +312,8 @@ def main():
     parser.add_argument("outfile", help="Output G-code file")
     parser.add_argument("--remove-m6", action="store_true",
                        help="Remove M6 tool change sequences")
+    parser.add_argument("--fix-helical-arcs", action="store_true",
+                       help="Fix helical arc precision issues by offsetting endpoints")
     parser.add_argument("--version", action="version", version="%(prog)s 1.0.0")
 
     args = parser.parse_args()
@@ -216,16 +331,20 @@ def main():
 
     # Process the file
     try:
+        current_file = args.infile
+
         if args.remove_m6:
             print("Processing: Removing M6 tool change sequences...")
-            remove_m6_sequences(args.infile, args.outfile)
-            # Use the output file as input for the next step
-            input_for_swap = args.outfile
-        else:
-            input_for_swap = args.infile
+            remove_m6_sequences(current_file, args.outfile)
+            current_file = args.outfile
+
+        if args.fix_helical_arcs:
+            print("Processing: Fixing helical arc precision issues...")
+            fix_helical_arcs(current_file, args.outfile)
+            current_file = args.outfile
 
         print("Processing: Swapping Z and X,Y moves...")
-        swap_z_and_xy_moves(input_for_swap, args.outfile)
+        swap_z_and_xy_moves(current_file, args.outfile)
 
         print(f"Processing complete. Final G-code saved to {args.outfile}")
 
